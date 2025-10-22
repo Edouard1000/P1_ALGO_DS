@@ -23,6 +23,10 @@ function VectNode(op, args, value, localjac)
     return VectNode(op, args, v, localjac, der)
 end
 
+x = [1 2 3; 4 5 6; 7 8 9]
+y = [1 2 3]
+x .- y
+
 VectNode(x::Number) = VectNode(nothing, VectNode[], x, nothing)
 VectNode(x::AbstractArray) = VectNode(nothing, VectNode[], x, nothing)
 
@@ -30,6 +34,9 @@ function hash(v::VectNode, h::UInt)
     return hash(objectid(v), h)
 end
 ==(a::VectNode, b::VectNode) = a === b
+
+Base.length(v::VectNode) = length(v.value)
+Base.size(v::VectNode) = size(v.value)
 
 isscalar(v::VectNode) = isa(v.value, Float64)
 shape(v::VectNode) = isa(v.value, Float64) ? () : size(v.value)
@@ -39,17 +46,83 @@ zeros_like(node::VectNode) = isa(node.value, Float64) ? 0.0 : zeros(size(node.va
 
 _promote_operand(x::Union{Number,AbstractArray}) = isa(x, Number) ? Float64(x) : convert.(Float64, x)
 
+function extend(A::Union{Matrix, Vector, Number}, sx::Tuple)
+    A_val = A isa Vector ? reshape(A, (length(A), 1)) :
+             A isa Number ? reshape([A], (1, 1)) : A
+    sa = size(A_val)
+	if length(sx) != 2
+		error("sx must be the shape of a matrix !")
+    elseif sa == sx
+        return A_val
+    elseif sa[1] == 1 && sa[2] == 1
+        return repeat(A_val, sx...)
+    elseif sa[2] == 1 && length(sx) == 2
+        return repeat(A_val, 1, sx[2])
+    elseif sa[1] == 1 && length(sx) == 2
+        return repeat(A_val, sx[1], 1)
+    else
+        error("can't extend matrix of size $(sa) to $(sx)")
+    end
+end
+
+function compress(A::Union{Matrix}, sx::Tuple)
+    sa = size(A)
+	if sx[1] == sa[1]
+		sum(A, dims=2)
+	elseif sx[2] == sa[2]
+		sum(A, dims=1)
+	else error("can't compress matrix $sa to $sx")
+	end
+end
+
+
+function compute_diag_prod(A::Matrix{Float64}, B::AbstractMatrix{Float64})
+	sa = size(A)
+	sb = size(B)
+
+	if sa[2] != sb[1]
+		error("can't compute product between $(sa) and $(sb)")
+	end
+
+	toreturn = zeros(Float64, sa[1])
+	for i in 1:sa[1]
+		toreturn[i] = sum(A[i, :] .* B[:, i])
+	end
+
+	return toreturn
+end
+
 
 localjac_dict = Dict{Symbol, Function}()
 
 localjac_dict[:+]  = (x,y) -> ( ones_like(x), ones_like(y) )
-localjac_dict[:-]  = (x,y) -> ( ones_like(x), -ones_like(y) )
+localjac_dict[:-]  = (x,y) -> begin
+	if shape(x) != shape(y) && !isscalar(x) && !isscalar(y)
+			return ()
+	end
+	return ( ones_like(x), -ones_like(y) )
+end
 localjac_dict[:*]  = (x,y) -> ( y.value, x.value )
-localjac_dict[:/]  = (x,y) -> ( isa(y.value, Float64) ? (1.0 / y.value) : (1.0 ./ y.value),
-                                 isa(x.value, Float64) ? (- x.value / (y.value^2)) : (- x.value ./ (y.value .^ 2)) )
+localjac_dict[:/]  = (x,y) -> begin
+	if shape(x) != shape(y) && !isscalar(x) && !isscalar(y)
+		return ()
+	end
+	return (
+	isa(y.value, Float64) ? (1.0 / y.value) : (1.0 ./ y.value),
+    isa(x.value, Float64) ? (- x.value / (y.value^2)) : (- x.value ./ (y.value .^ 2))
+	)
+end
 localjac_dict[:exp]  = x -> ( isa(x.value, Float64) ? exp(x.value) : exp.(x.value), )
 localjac_dict[:log]  = x -> ( isa(x.value, Float64) ? (1.0 / x.value) : (1.0 ./ x.value), )
 localjac_dict[:tanh] = x -> ( isa(x.value, Float64) ? (1.0 - tanh(x.value)^2) : (1 .- tanh.(x.value).^2), )
+localjac_dict[:relu] = x -> ( x.value .> 0,  )
+localjac_dict[:sum] = x -> (ones_like(x), )
+localjac_dict[:maximum] = x -> begin
+    mask = zeros(size(x.value))
+    idx = argmax(x.value)
+    mask[idx] = 1.0
+    return (mask,)
+end
 
 function Base.broadcasted(op::Function, x::VectNode)
     sym = Symbol(op)
@@ -103,36 +176,107 @@ Base.:+(x::VectNode, y::Union{AbstractArray, Number}) = x.+y
 Base.:-(x::VectNode, y::VectNode) = x.-y
 Base.:-(x::Union{AbstractArray, Number}, y::VectNode) = x.-y
 Base.:-(x::VectNode, y::Union{AbstractArray, Number}) = x.-y
+Base.:-(x::VectNode) = 0 .- x
 
-Base.:/(x::VectNode, y::VectNode) = x./y
+Base.:/(x::VectNode, y::VectNode) = x./y # à modifier si en faisant x / y on veut x * inv(y)
 Base.:/(x::Union{AbstractArray, Number}, y::VectNode) = x./y
 Base.:/(x::VectNode, y::Union{AbstractArray, Number}) = x./y
 
+Base.isless(x::VectNode, y::Number) = x.value .< y
+Base.isless(x::Number, y::VectNode) = x .< y.value
+Base.isless(x::VectNode, y::VectNode) = x.value .< y.value
+
 localjac_dict2 = Dict{Symbol, Function}()
 
-localjac_dict2[:*] = (x, y) -> function (x, y)
-	x_isScalar , y_isScalar = isscalar(x), isScalar(y)
-	if x_isScalar || y_isScalar
-		return localjac_dict[:*](x, y)
+localjac_dict2[:*] = (f) -> begin
+	x = f.args[1] ; y = f.args[2]
+	y_val, x_val, f_der = y.value, x.value, f.derivative
+	x_der = f_der * (y_val'); y_der = (x_val') * f_der
+	x.derivative .+= x_der; y.derivative .+= y_der 
+end
+
+localjac_dict2[:sum] = (f) -> begin
+	x = f.args[1] ; sx = shape(x); sf = shape(f)
+	if sf[1] == 1
+		x.derivative .+= repeat(f.derivative, sx[1], 1)
 	else
-		sx, sy = shape(x), shape(y)
-		# TODO
+		x.derivative .+= repeat(f.derivative, 1, sx[2])
 	end
 end
 
+localjac_dict2[:maximum] = (f) -> begin
+	x = f.args[1] ; sx = shape(x); sf = shape(f)
+	mask = zeros(Float64, sx)
+	if sf[1] == 1
+		for j in 1:sx[2]
+			col = view(x.value, :, j)
+			imax = argmax(col)
+			mask[imax, j] = 1.0
+		end
+		x.derivative .+= mask .* repeat(f.derivative, sx[1], 1)
+	else
+		for i in 1:sx[1]
+			row = view(x.value, i, :)
+			jmax = argmax(row)
+			mask[i, jmax] = 1.0
+		end
+		x.derivative .+= mask .* repeat(f.derivative, 1, sx[2])
+	end 
+end
+
+localjac_dict2[:/] = (f) -> begin
+	x = f.args[1] ; z = f.args[2]; 
+	dl_dx = f.derivative ./ extend(z.value, shape(x))
+	dl_dz = - compute_diag_prod(x.value, f.derivative') ./ (z.value .^2)
+	x.derivative .+= dl_dx
+	z.derivative .+= dl_dz
+end
+
+localjac_dict2[:-] = (f) -> begin
+	x = f.args[1]; z = f.args[2]
+	x.derivative .+= f.derivative
+	z.derivative .+= compress(f.derivative, shape(z))
+end
+
 function Base.:*(x::VectNode, y::VectNode)
-	jac = localjac_dict2[:*]
-	return VectNode(*, [x, y], x.value * y.value, jac)
+	if isscalar(x) || isscalar(y) return x.*y end
+	return VectNode(Symbol(*), [x, y], x.value * y.value, ())
 end
 
 Base.:*(x::VectNode, y::Union{Number,AbstractArray}) = begin
-	jac, _ = localjac_dict2[:*]
-	return VectNode(*, [x], x.value * y.value, (jac, ))
+	if isscalar(x) || isa(y, Number) return x.*y end
+	y_node = VectNode(y)
+	return VectNode(Symbol(*), [x, y_node], x.value * y, ())
 end
 
 Base.:*(x::Union{Number, AbstractArray}, y::VectNode) = begin
-	_, jac = localjac_dict2[:*]
-	return VectNode(*, [y], x.value * y.value, (jac, ))
+	if isa(x, Number) || isscalar(y) return x.*y end
+	x_node = VectNode(x)
+	return VectNode(Symbol(*), [x_node, y], x * y.value, ())
+end
+
+function Base.sum(v::VectNode; dims=nothing)
+    if isnothing(dims)
+        if isscalar(v)
+            return v
+        else
+            return VectNode(:sum, [v], sum(v.value), localjac_dict[:sum](v))
+        end
+    else
+        return VectNode(:sum, [v], sum(v.value, dims=dims), ())
+    end
+end
+
+function Base.maximum(v::VectNode; dims=nothing)
+    if isnothing(dims)
+        if isscalar(v)
+            return v
+        else
+            return VectNode(:maximum, [v], maximum(v.value), localjac_dict[:maximum](v))
+        end
+    else
+        return VectNode(:maximum, [v], maximum(v.value, dims=dims), ())
+    end
 end
 
 function _accumulate_derivative!(arg::VectNode, df, jac)
@@ -148,6 +292,17 @@ function _accumulate_derivative!(arg::VectNode, df, jac)
     return nothing
 end
 
+function _accumulate_derivative!(args::Vector{VectNode}, f, jac)
+    if isa(jac, Tuple) && length(jac) == 0 # needs special endeling as *
+		localjac_dict2[f.op](f)
+	else
+		for (i, arg) in enumerate(args)
+			jac = f.localjac[i]
+        	_accumulate_derivative!(arg, f.derivative, jac)
+		end
+	end
+end
+
 function topo_sort!(visited::Set{VectNode}, topo::Vector{VectNode}, f::VectNode)
     if !(f in visited)
         push!(visited, f)
@@ -160,10 +315,7 @@ end
 
 function _backward!(f::VectNode)
     if isnothing(f.op) || isnothing(f.localjac) return end
-    for (i, arg) in enumerate(f.args)
-        jac = f.localjac[i]
-        _accumulate_derivative!(arg, f.derivative, jac)
-    end
+    _accumulate_derivative!(f.args, f, f.localjac)
 end
 
 function backward!(f::VectNode)
@@ -198,87 +350,11 @@ function gradient!(f, g::Flatten, x::Flatten)
     return g
 end
 
-gradient(f, x) = gradient!(f, zero(x), x)
-
+gradient(f, x) = begin
+	g = deepcopy(x)
+	gradient!(f, g, x)
 end
 
-using Test
-using LinearAlgebra
-
-# --------------------------
-# 1) Test scalaire
-# --------------------------
-function test_scalar()
-	x = VectNode(2.0)
-	y = VectNode(3.0)
-	z = (2.0 .* x) .* y + 5.0
-	backward!(z)
-	@test z.value == 17.0
-	@test x.derivative == 6.0
-	@test y.derivative == 4.0
 end
-
-# --------------------------
-# 2) Test vecteur
-# --------------------------
-function test_vector()
-    x = VectNode([1.0, 2.0, 3.0])
-    y = VectNode([2.0, 3.0, 4.0])
-    z = x .* y .+ 1.0
-    backward!(z)
-    @test z.value == [3.0, 7.0, 13.0]
-    @test x.derivative == y.value
-    @test y.derivative == x.value
-end
-
-# --------------------------
-# 3) Test matrice
-# --------------------------
-function test_matrix()
-    x = VectNode([1.0 2.0; 3.0 4.0])
-    y = VectNode([2.0 0.5; 1.0 3.0])
-    z = x .* y .+ 1.0
-    backward!(z)
-    @test z.value == [3.0 2.0; 4.0 13.0]
-    @test x.derivative == y.value
-    @test y.derivative == x.value
-end
-
-# --------------------------
-# 4) Test combinaison scalaire + vecteur
-# --------------------------
-function test_scalar_vector()
-    y = VectNode([1.0, 2.0, 3.0])
-    z = 2 .* y .+ 1.0
-    backward!(z)
-    @test z.value == [3.0, 5.0, 7.0]
-    @test y.derivative == fill(2.0, 3) # ∂z/∂y_i = x
-end
-
-x_t = rand(1, 3)
-w1_t = rand(3, 5)
-w2_t = rand(5, 2)
-x = VectNode(x_t)
-w1 = VectNode(w1_t)
-w2 = VectNode(w2_t)
-y = x * w1 * w2
-y_t = x_t * w1_t * w2_t
-y_t
-y.value
-backward!(y) #do not work for the moment
-
-# --------------------------
-# Run all tests
-# --------------------------
-
-x = [1, 0, 2]
-y = [1, 2, 2]
-
-x*y
-
-test_scalar()
-test_vector()
-test_matrix()
-test_scalar_vector()
 
 
