@@ -7,18 +7,22 @@ mutable struct VectNode
     op::Union{Nothing, String}
     args::Vector{VectNode}
     value::Union{Float64, Array{Float64}}
-    derivative::Union{Float64, Array{Float64}}      
+    derivative::Union{Nothing, Float64, Array{Float64}} # dl/df  #Jv(L)
+	forward_derivative::Union{Nothing, Float64, Array{Float64}} #df/dx 
 	memory::Union{Nothing, Float64, Tuple{AbstractArray, AbstractArray}, AbstractArray, Vector{Int}}
+	need_grad::Bool
+	need_hess::Bool
 end
 
 # -------------------- init -------------------- #
-function VectNode(op, args, value)
+function VectNode(op, args, value, need_grad = true, need_hess = false)
     v = _make_value(value)
-    return VectNode(op, args, v, zeros_like(v), nothing)
+	grad = (need_grad ? zeros_like(v) : nothing)
+	f_grad = (need_hess ? zeros_like(v) : nothing)
+	return VectNode(op, args, v, grad,f_grad, nothing, need_grad, need_hess)
 end
-VectNode(x::Number) = VectNode(nothing, VectNode[], x)
-VectNode(x::AbstractArray) = VectNode(nothing, VectNode[], x)
-
+VectNode(x::Number, need_grad = true, need_hess = false) = VectNode(nothing, VectNode[], x, need_grad, need_hess)
+VectNode(x::AbstractArray, need_grad = true, need_hess = false) = VectNode(nothing, VectNode[], x, need_grad, need_hess)
 # -------------------- static functions -------------------- #
 _make_value(x::Union{Number, AbstractArray}) = isa(x, Number) ? Float64(x) : convert.(Float64, x)
 ones_like(val::Union{Float64, Array{Float64}} ) = isa(val, Float64) ? 1.0 : ones(size(val))
@@ -69,6 +73,16 @@ function compute_diag_prod(A::Matrix{Float64}, B::AbstractMatrix{Float64})
 	return toreturn
 end
 
+function tensormul(H::Array{Float64,3}, d::Array{Float64,1})
+    n, n2, p = size(H)
+    @assert n == n2 && length(d) == n "Dimensions mismatch"
+    R = zeros(n, p)
+    for k = 1:p
+        R[:,k] = H[:,:,k] * d
+    end
+    return R
+end
+
 # -------------------- class functions -------------------- #
 hash(v::VectNode, h::UInt) = hash(objectid(v), h)
 ==(a::VectNode, b::VectNode) = a === b
@@ -107,7 +121,7 @@ check_param[".-"] = (sx, sy) -> begin
 	if sx != () && sy != () && length(sx) != 2 && sx != sy error("soustraction not implemented for $sx and $sz") end
 end
 check_param[".+"] = (sx, sy) -> begin
-	if !isscalar(x) && !isscalar(y) && (shape(x) != shape(y)) error("addition broadcasting for different size not implemented yet") end
+	if sx != () && sy != () && (sx != sy) error("addition broadcasting for different size not implemented yet") end
 end
 check_param[".exp"] = (sx) -> begin
 	return
@@ -130,13 +144,13 @@ local_back_rule["*"] = (f) -> begin
 	x = f.args[1] ; y = f.args[2]
 	sx, sy = shape(x), shape(y)
 	y_val, x_val, f_der = y.value, x.value, f.derivative
-	x_der = f_der * (y_val'); y_der = (x_val') * f_der
-	x.derivative .+= x_der; y.derivative .+= y_der 
+	if x.need_grad x.derivative .+= f_der * (y_val') end
+	if y.need_grad y.derivative .+= (x_val') * f_der  end
 end
 local_back_rule[".*"] = (f) -> begin
 	x = f.args[1] ; y = f.args[2] ; sx = shape(x) ; sy = shape(y)
-	x.derivative = x.derivative .+ f.derivative .* y.value
-	y.derivative = y.derivative .+ f.derivative .* x.value
+	if x.need_grad x.derivative = x.derivative .+ f.derivative .* y.value end
+	if y.need_grad y.derivative = y.derivative .+ f.derivative .* x.value end
 end
 local_back_rule["sum"] = (f) -> begin
 	x = f.args[1] ; sx = shape(x)
@@ -185,25 +199,23 @@ local_back_rule["./"] = (f) -> begin
 	x = f.args[1] ; z = f.args[2]; sx = shape(x); sz = shape(z)
 	if shape(x) != shape(z) && !isscalar(x) && !isscalar(z)
 		if isnothing(f.memory) f.memory = (extend(z.value, shape(x)), z.value .^ 2) end
-		dl_dx = f.derivative ./ f.memory[1]
-		dl_dz = - compute_diag_prod(x.value, f.derivative') ./ f.memory[2]
-		x.derivative .+= dl_dx
-		z.derivative .+= dl_dz
+		if x.need_grad x.derivative .+= f.derivative ./ f.memory[1] end
+		if z.need_grad z.derivative .-= compute_diag_prod(x.value, f.derivative') ./ f.memory[2] end
 	else
 		if isnothing(f.memory) f.memory = x.value ./ (z.value .^2) end
-		x.derivative = x.derivative .+ f.derivative ./ z.value
-		z.derivative = z.derivative .- f.derivative .* f.memory
+		if x.need_grad x.derivative = x.derivative .+ f.derivative ./ z.value end
+		if z.need_grad z.derivative = z.derivative .- f.derivative .* f.memory end
 	end
 end
 local_back_rule[".-"] = (f) -> begin
 	x = f.args[1]; z = f.args[2]; sx = shape(x); sz = shape(z)
-	x.derivative = x.derivative .+ f.derivative
-	z.derivative = z.derivative .- compress(f.derivative, shape(z)) # pour le broadcasting à taille différente !
+	if x.need_grad x.derivative = x.derivative .+ f.derivative end
+	if z.need_grad z.derivative = z.derivative .- compress(f.derivative, shape(z)) end# pour le broadcasting à taille différente !
 end
 local_back_rule[".+"]  = (f) -> begin
 	x = f.args[1]; y=f.args[2]
-	x.derivative .+= f.derivative 
-	y.derivative .+= f.derivative
+	if x.need_grad x.derivative .+= f.derivative end
+	if y.need_grad y.derivative .+= f.derivative end
 end
 local_back_rule[".exp"]  = (f) -> begin
 	x = f.args[1]
@@ -246,14 +258,14 @@ end
 
 function Base.broadcasted(op::Function, x::VectNode, y::Union{Number,AbstractArray})
     sym = "." * string(op)
-    y_node = VectNode(y)
+    y_node = VectNode(y, false, false)
 	haskey(check_param, sym) ? check_param[sym](shape(x), shape(y_node)) : error("symbole $sym not implemented")
     return VectNode(sym, [x, y_node], op.(x.value, y_node.value))
 end
 
 function Base.broadcasted(op::Function, x::Union{Number,AbstractArray}, y::VectNode)
     sym = "." * string(op)
-    x_node = VectNode(x)
+    x_node = VectNode(x, false, false)
 	haskey(check_param, sym) ? check_param[sym](shape(x_node), shape(y)) : error("symbole $sym not implemented")
     return VectNode(sym, [x_node, y], op.(x_node.value, y.value))
 end
@@ -292,14 +304,14 @@ end
 
 Base.:*(x::VectNode, y::Union{Number,AbstractArray}) = begin
 	if isscalar(x) || isa(y, Number) return x.*y end
-	y_node = VectNode(y)
+	y_node = VectNode(y, false, false)
 	haskey(check_param, "*") ? check_param["*"](shape(x), shape(y_node)) : error("symbole * not implemented")
 	return VectNode("*", [x, y_node], x.value * y)
 end
 
 Base.:*(x::Union{Number, AbstractArray}, y::VectNode) = begin
 	if isa(x, Number) || isscalar(y) return x.*y end
-	x_node = VectNode(x)
+	x_node = VectNode(x, false, false)
 	haskey(check_param, "*") ? check_param["*"](shape(x_node), shape(y)) : error("symbole * not implemented")
 	return VectNode("*", [x_node, y], x * y.value)
 end
@@ -352,7 +364,8 @@ function backward!(f::VectNode)
     if isa(f.derivative, Float64)
         f.derivative = 1.0
     else
-        f.derivative .= ones(size(f.value))
+        f.derivative .= zeros(size(f.value))
+		f.derivative[wch_out] = 1.0
     end
     for n in topo
         if !isnothing(n.op)
@@ -381,6 +394,8 @@ gradient(f, x) = begin
 	g = deepcopy(x)
 	gradient!(f, g, x)
 end
+
+
 
 end
 
