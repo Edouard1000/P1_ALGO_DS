@@ -1,6 +1,8 @@
 module VectReverse
 import ..Flatten
 import Base: hash, ==
+using SparseArrays
+
 
 # -------------------- definition -------------------- #
 mutable struct VectNode
@@ -13,16 +15,16 @@ mutable struct VectNode
 	need_grad::Bool
 	need_hess::Bool
 end
-
 # -------------------- init -------------------- #
-function VectNode(op, args, value, need_grad = true, need_hess = false)
+function VectNode(op, args, value, need_grad = true, need_hess = false, f_grad = nothing)
     v = _make_value(value)
 	grad = (need_grad ? zeros_like(v) : nothing)
-	f_grad = (need_hess ? zeros_like(v) : nothing)
-	return VectNode(op, args, v, grad,f_grad, nothing, need_grad, need_hess)
+	f_gradi = isnothing(f_grad) ? nothing : _make_value(f_grad) 
+	return VectNode(op, args, v, grad, f_gradi, nothing, need_grad, need_hess)
 end
-VectNode(x::Number, need_grad = true, need_hess = false) = VectNode(nothing, VectNode[], x, need_grad, need_hess)
-VectNode(x::AbstractArray, need_grad = true, need_hess = false) = VectNode(nothing, VectNode[], x, need_grad, need_hess)
+VectNode(x::Number, need_grad = true, need_hess = false, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
+VectNode(x::AbstractArray, need_grad = true, need_hess = false, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
+
 # -------------------- static functions -------------------- #
 _make_value(x::Union{Number, AbstractArray}) = isa(x, Number) ? Float64(x) : convert.(Float64, x)
 ones_like(val::Union{Float64, Array{Float64}} ) = isa(val, Float64) ? 1.0 : ones(size(val))
@@ -243,6 +245,12 @@ local_back_rule[".^"] = (f) -> begin
 	x.derivative = x.derivative .+ f.derivative .* f.memory
 end
 
+local_forw_rule = Dict{String, Function}()
+local_forw_rule[".*"] = (f) -> begin
+	x = f.args[1] ; y = f.args[2] ; sx = shape(x) ; sy = shape(y)
+	f.forward_derivative = x.value .* y.forward_derivative + y.value .* x.forward_derivative
+end
+
 # ............... broadcasting ............... #
 function Base.broadcasted(op::Function, x::VectNode)
     sym = "." * string(op)
@@ -346,6 +354,16 @@ end
 
 # ............... compute gradient  ............... #
 
+function forward!(f::VectNode)
+	if length(f.args) == 0 f.forward_derivative = zeros_like(f)
+	else 
+		for arg in f.args
+			if isnothing(arg.forward_derivative) forward!(arg) end
+		end
+	end
+	local_forw_rule[f.op](f)
+end
+
 function topo_sort!(visited::Set{VectNode}, topo::Vector{VectNode}, f::VectNode)
     if !(f in visited)
         push!(visited, f)
@@ -375,6 +393,14 @@ function backward!(f::VectNode)
     return f
 end
 
+function hess(f, x::Flatten, dir::Flatten)
+	x_nodes = Flatten([VectNode(x.components[i], true, true, dir.components[i]) for i in 1: length(x.components)])
+	last_node = f(x_nodes)
+	forward!(last_node)
+	backward!(last_node)
+	#on doit encore appliqué la big formule !
+end
+
 function gradient!(f, g::Flatten, x::Flatten)
     x_nodes = Flatten(VectNode.(x.components))
     expr = f(x_nodes)
@@ -394,8 +420,6 @@ gradient(f, x) = begin
 	g = deepcopy(x)
 	gradient!(f, g, x)
 end
-
-
 
 end
 
