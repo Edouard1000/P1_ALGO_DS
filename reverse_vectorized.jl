@@ -30,11 +30,15 @@ _make_value(x::Union{Number, AbstractArray}) = isa(x, Number) ? Float64(x) : con
 ones_like(val::Union{Float64, Array{Float64}} ) = isa(val, Float64) ? 1.0 : ones(size(val))
 zeros_like(val::Union{Float64, Array{Float64}} ) = isa(val, Float64) ? 0.0 : zeros(size(val))
 
-function extend(A::Union{Matrix}, sx::Tuple)
-    sa = size(A)
-    if sa == sx
+function extend(A::Float64, sx::Tuple)
+	return isempty(sx) ? A : fill(A, sx)
+end
+
+function extend(A::Matrix, sx::Tuple)
+	sa = size(A)
+	if sa == sx
         return A
-	elseif sa[2] == 1 && length(sx) == 2
+    elseif sa[2] == 1 && length(sx) == 2
         return repeat(A, 1, sx[2])
     elseif sa[1] == 1 && length(sx) == 2
         return repeat(A, sx[1], 1)
@@ -43,12 +47,33 @@ function extend(A::Union{Matrix}, sx::Tuple)
     end
 end
 
+function extend(A::Vector, sx::Tuple)
+    sa = size(A)
+    if sa == sx
+        return A
+    end
+
+	if length(sx) == 2
+		if sx[1] == length(A) && sx[2] > 1
+			return repeat(reshape(A, :, 1), 1, sx[2])
+		elseif sx[2] == length(A) && sx[1] > 1
+			return repeat(reshape(A, 1, :), sx[1], 1)
+		end
+	elseif length(sx) == 1 && sx[1] == length(A)
+		return A
+	end
+	error("can't extend vector of size $(sa) to $(sx)")
+end
+
+
 function compress(A::Matrix, sx::Tuple)
     sa = size(A)
-	if sx[1] == sa[1]
-		sum(A, dims=2)
+	if isempty(sx)
+		return sum(A)
+	elseif sx[1] == sa[1]
+		return sum(A, dims=2)
 	elseif sx[2] == sa[2]
-		sum(A, dims=1)
+		return sum(A, dims=1)
 	else error("can't compress matrix $sa to $sx")
 	end
 end
@@ -162,7 +187,6 @@ local_back_rule["sum_all"] = (f) -> begin
 	x = f.args[1]
 	x.derivative = x.derivative .+ f.derivative
 end
-
 local_back_rule["maximum"] = (f) -> begin
 	x = f.args[1]; sx = shape(x); sf = shape(f)
 	if sf[1] == 1
@@ -246,10 +270,107 @@ local_back_rule[".^"] = (f) -> begin
 end
 
 local_forw_rule = Dict{String, Function}()
-local_forw_rule[".*"] = (f) -> begin
-	x = f.args[1] ; y = f.args[2] ; sx = shape(x) ; sy = shape(y)
-	f.forward_derivative = x.value .* y.forward_derivative + y.value .* x.forward_derivative
+
+local_forw_rule["*"] = (f) -> begin
+    x = f.args[1]; y = f.args[2]
+    f.forward_derivative = x.forward_derivative * y.value + x.value * y.forward_derivative
 end
+
+local_forw_rule[".*"] = (f) -> begin
+    x = f.args[1]; y = f.args[2]
+    f.forward_derivative = x.forward_derivative .* y.value .+ y.forward_derivative .* x.value
+end
+
+local_forw_rule["sum"] = (f) -> begin
+    x = f.args[1]; sf = shape(f)
+    f.forward_derivative = compress(x.forward_derivative, sf)
+end
+local_forw_rule["sum_all"] = (f) -> begin
+    x = f.args[1]
+    f.forward_derivative = compress(x.forward_derivative, ())
+end
+local_forw_rule["maximum"] = (f) -> begin
+    x = f.args[1]; sx = shape(x); sf = shape(f)
+	f.forward_derivative = zeros_like(f)
+    if sf[1] == 1
+        if isnothing(f.memory)
+            idxs = Vector{Int}(undef, sx[2])
+            for j in 1:sx[2]
+                col = view(x.value, :, j)
+                idxs[j] = argmax(col)
+            end
+            f.memory = idxs
+        end
+        for j in 1:sx[2]
+            f.forward_derivative[1, j] = x.forward_derivative[f.memory[j], j]
+        end
+    else
+        if isnothing(f.memory)
+            idxs = Vector{Int}(undef, sx[1])
+            for i in 1:sx[1]
+                row = view(x.value, i, :)
+                idxs[i] = argmax(row)
+            end
+            f.memory = idxs
+        end
+        for i in 1:sx[1]
+            f.forward_derivative[i, 1] = x.forward_derivative[i, f.memory[i]]
+        end
+    end
+end
+
+local_forw_rule["maximum_all"] = (f) -> begin
+    x = f.args[1]
+    if isnothing(f.memory) f.memory = argmax(x.value) end
+    f.forward_derivative = x.forward_derivative[f.memory]
+end
+
+local_forw_rule["./"] = (f) -> begin
+    x = f.args[1]; z = f.args[2]; sx = shape(x); sz = shape(z)
+    if shape(x) != shape(z) && !isscalar(x) && !isscalar(z)
+        z_val = extend(z.value, sx)
+        z_der = extend(z.forward_derivative, sx)
+        f.forward_derivative = x.forward_derivative .* (1 ./ z_val) .- (x.value .* (z_der .* (1 ./ (z_val .^ 2))))
+    else
+        f.forward_derivative = x.forward_derivative .* (1 ./ z.value) .- (x.value .* (z.forward_derivative .* (1 ./ (z.value .^ 2))))
+    end
+end
+
+local_forw_rule[".-"] = (f) -> begin
+    x = f.args[1]; z = f.args[2]; sx = shape(x)
+    f.forward_derivative = x.forward_derivative .- extend(z.forward_derivative, sx)
+end
+
+local_forw_rule[".+"] = (f) -> begin
+    x = f.args[1]; y = f.args[2]
+    f.forward_derivative = x.forward_derivative .+ y.forward_derivative
+end
+
+local_forw_rule[".exp"] = (f) -> begin
+    x = f.args[1]
+    f.forward_derivative = exp.(x.value) .* x.forward_derivative
+end
+
+local_forw_rule[".log"] = (f) -> begin
+    x = f.args[1]
+    f.forward_derivative = (1.0 ./ x.value) .* x.forward_derivative
+end
+
+local_forw_rule[".tanh"] = (f) -> begin
+    x = f.args[1]
+    f.forward_derivative = (1 .- tanh.(x.value).^2) .* x.forward_derivative
+end
+
+local_forw_rule[".relu"] = (f) -> begin
+    x = f.args[1]
+    f.forward_derivative = (x.value .> 0) .* x.forward_derivative
+end
+
+local_forw_rule[".^"] = (f) -> begin
+    x = f.args[1]; n = f.args[2].value
+    f.forward_derivative = (n .* (x.value .^ (n .- 1))) .* x.forward_derivative
+end
+
 
 # ............... broadcasting ............... #
 function Base.broadcasted(op::Function, x::VectNode)
@@ -355,14 +476,18 @@ end
 # ............... compute gradient  ............... #
 
 function forward!(f::VectNode)
-	if length(f.args) == 0 f.forward_derivative = zeros_like(f)
-	else 
-		for arg in f.args
-			if isnothing(arg.forward_derivative) forward!(arg) end
-		end
-	end
-	local_forw_rule[f.op](f)
+    if isempty(f.args)
+        f.forward_derivative = zeros_like(f)
+        return
+    end
+    for arg in f.args
+        if isnothing(arg.forward_derivative)
+            forward!(arg)
+        end
+    end
+    local_forw_rule[f.op](f)
 end
+
 
 function topo_sort!(visited::Set{VectNode}, topo::Vector{VectNode}, f::VectNode)
     if !(f in visited)
@@ -382,8 +507,7 @@ function backward!(f::VectNode)
     if isa(f.derivative, Float64)
         f.derivative = 1.0
     else
-        f.derivative .= zeros(size(f.value))
-		f.derivative[wch_out] = 1.0
+        error("you're suppose to have a loss function !")
     end
     for n in topo
         if !isnothing(n.op)
@@ -399,6 +523,36 @@ function hess(f, x::Flatten, dir::Flatten)
 	forward!(last_node)
 	backward!(last_node)
 	#on doit encore appliqué la big formule !
+end
+
+function slow_grad!(f, g::Flatten, x::Flatten)
+    for i in 1:length(x.components)
+        xi = x.components[i]
+        if isa(xi, Number)
+            x_nodes = Flatten(VectNode.(x.components))
+            x_nodes.components[i].forward_derivative = 1.0
+            expr = f(x_nodes)
+            forward!(expr)
+            val = expr.forward_derivative
+            g.components[i] = isa(val, Number) ? val : val[1]
+        else
+            for idx in eachindex(xi)
+                x_nodes = Flatten(VectNode.(x.components))
+                seed = zeros_like(x_nodes.components[i].value)
+                seed[idx] = 1.0
+                x_nodes.components[i].forward_derivative = seed
+                expr = f(x_nodes)
+                forward!(expr)
+                val = expr.forward_derivative
+                if isa(g.components[i], Number)
+                    g.components[i] = isa(val, Float64) ? val : val[1]
+                else
+                    g.components[i][idx] = isa(val, Float64) ? val : val[1]
+                end
+            end
+        end
+    end
+	return g
 end
 
 function gradient!(f, g::Flatten, x::Flatten)
@@ -418,7 +572,7 @@ end
 
 gradient(f, x) = begin
 	g = deepcopy(x)
-	gradient!(f, g, x)
+	slow_grad!(f, g, x)
 end
 
 end
