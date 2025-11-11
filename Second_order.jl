@@ -17,15 +17,15 @@ mutable struct VectNode
 	need_hess::Bool
 end
 # -------------------- init -------------------- #
-function VectNode(op, args, value, need_grad = true, need_hess = false, f_grad = nothing)
+function VectNode(op, args, value, need_grad = true, need_hess = true, f_grad = nothing)
     v = _make_value(value)
 	grad = (need_grad ? zeros_like(v) : nothing)
     second_order_derivative = (need_hess ? zeros_like(v) : nothing)
 	f_gradi = isnothing(f_grad) ? nothing : _make_value(f_grad) 
 	return VectNode(op, args, v, grad, f_gradi, second_order_derivative, nothing, need_grad, need_hess)
 end
-VectNode(x::Number, need_grad = true, need_hess = false, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
-VectNode(x::AbstractArray, need_grad = true, need_hess = false, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
+VectNode(x::Number, need_grad = true, need_hess = true, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
+VectNode(x::AbstractArray, need_grad = true, need_hess = true, f_grad = nothing) = VectNode(nothing, VectNode[], x, need_grad, need_hess, f_grad)
 
 # -------------------- static functions -------------------- #
 _make_value(x::Union{Number, AbstractArray}) = isa(x, Number) ? Float64(x) : convert.(Float64, x)
@@ -377,111 +377,156 @@ local_forw_over_rev_rule = Dict{String, Function}()
 local_forw_over_rev_rule["*"] = (f) -> begin
     x, y = f.args
     if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative * y.value' .+ f.derivative * y.forward_derivative'
+        x.second_order_derivative .+= f.second_order_derivative * y.value' .+ f.derivative * y.forward_derivative'
     end
     if y.need_hess
-        y.second_order_derivative .+= x.value' * f.forward_derivative .+ x.forward_derivative' * f.derivative
+        y.second_order_derivative .+= x.value' * f.second_order_derivative .+ x.forward_derivative' * f.derivative
     end
 end
 
 local_forw_over_rev_rule[".*"] = (f) -> begin
     x, y = f.args
     if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative .* y.value .+ f.derivative .* y.forward_derivative
+        x.second_order_derivative .+= f.second_order_derivative .* y.value .+ f.derivative .* y.forward_derivative
     end
     if y.need_hess
-        y.second_order_derivative .+= f.forward_derivative .* x.value .+ f.derivative .* x.forward_derivative
+        y.second_order_derivative .+= f.second_order_derivative .* x.value .+ f.derivative .* x.forward_derivative
     end
 end
 
 local_forw_over_rev_rule[".+"] = (f) -> begin
     x, y = f.args
-    if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative
-    end
-    if y.need_hess
-        y.second_order_derivative .+= f.forward_derivative
+    
+    if isscalar(f)
+        if x.need_hess
+            x.second_order_derivative += f.second_order_derivative
+        end
+        if y.need_hess
+            y.second_order_derivative += f.second_order_derivative
+        end
+    else
+        if x.need_hess
+            x.second_order_derivative .+= f.second_order_derivative
+        end
+        if y.need_hess
+            y.second_order_derivative .+= f.second_order_derivative
+        end
     end
 end
 
 local_forw_over_rev_rule[".-"] = (f) -> begin
     x, y = f.args
-    if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative
-    end
-    if y.need_hess
-        y.second_order_derivative .-= f.forward_derivative
+    
+    if isscalar(f)
+        if x.need_hess
+            x.second_order_derivative += f.second_order_derivative
+        end
+        if y.need_hess
+            y.second_order_derivative -= f.second_order_derivative
+        end
+    else
+        if x.need_hess
+            x.second_order_derivative .+= f.second_order_derivative
+        end
+        if y.need_hess
+            y.second_order_derivative .-= f.second_order_derivative
+        end
     end
 end
 
 local_forw_over_rev_rule["./"] = (f) -> begin
     x, z = f.args
-    # Pré-calculs
-    z2 = z.value .^ 2
-    z3 = z.value .^ 3
     
-    # HVP pour X: d(dL/df * 1/z)/dv = d(dL/df)/dv * 1/z + dL/df * d(1/z)/dv
-    if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative ./ z.value .- f.derivative .* (z.forward_derivative ./ z2)
-    end
-    
-    # HVP pour Z: d(-dL/df * x/z^2)/dv
-    if z.need_hess
-        # Terme 1: - d(dL/df)/dv * x/z^2
-        t1 = -f.forward_derivative .* (x.value ./ z2)
+    if isscalar(f)
         
-        # Terme 2: - dL/df * d(x/z^2)/dv
-        # d(x/z^2)/dv = (x'_v * z^2 - x * 2z * z'_v) / z^4
-        t2_num = z2 .* x.forward_derivative .- 2.0 .* x.value .* z.value .* z.forward_derivative
-        t2 = -f.derivative .* (t2_num ./ (z2 .^ 2)) # z^4 = (z^2)^2
+        z_val = z.value
+        z2 = z_val^2
         
-        z.second_order_derivative .+= t1 .+ t2
+        if x.need_hess
+            # Pas de '.+=' pour un scalaire !
+            x.second_order_derivative += f.second_order_derivative / z_val - f.derivative * (z.forward_derivative / z2)
+        end
+        
+        if z.need_hess
+            x_val = x.value
+            t1 = -f.second_order_derivative * (x_val / z2)
+            
+            t2_num = x.forward_derivative * z2 - 2.0 * x_val * z_val * z.forward_derivative
+            t2_den = z2^2 # (z_val^2)^2 == z_val^4. t2_den = z2^2 est correct.
+            t2 = -f.derivative * (t2_num / t2_den)
+            
+            # Pas de '.+=' pour un scalaire !
+            z.second_order_derivative += t1 + t2
+        end
+        
+    else
+ 
+        z2 = z.value .^ 2
+        
+        if x.need_hess
+            x.second_order_derivative .+= f.second_order_derivative ./ z.value .- f.derivative .* (z.forward_derivative ./ z2)
+        end
+        
+        if z.need_hess
+            t1 = -f.second_order_derivative .* (x.value ./ z2)
+            t2_num = z2 .* x.forward_derivative .- 2.0 .* x.value .* z.value .* z.forward_derivative
+            t2 = -f.derivative .* (t2_num ./ (z2 .^ 2)) 
+            
+            z.second_order_derivative .+= t1 .+ t2
+        end
     end
 end
 
 local_forw_over_rev_rule["sum"] = (f) -> begin
     x = f.args[1]
     if x.need_hess
-        x.second_order_derivative .+= extend(f.forward_derivative, shape(x))
+        x.second_order_derivative .+= extend(f.second_order_derivative, shape(x))
     end
 end
 
 local_forw_over_rev_rule["sum_all"] = (f) -> begin
     x = f.args[1]
     if x.need_hess
-        x.second_order_derivative .+= extend(f.forward_derivative, size(x.value))
+        x.second_order_derivative .+= extend(f.second_order_derivative, size(x.value))
     end
 end
 local_forw_over_rev_rule[".exp"] = (f) -> begin
     x = f.args[1]
     e = exp.(x.value)
     if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative .* e .+ f.derivative .* (e .* x.forward_derivative)
+        x.second_order_derivative .+= f.second_order_derivative .* e .+ f.derivative .* (e .* x.forward_derivative)
     end
 end
 
 local_forw_over_rev_rule[".log"] = (f) -> begin
     x = f.args[1]
     if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative ./ x.value .+ f.derivative .* ((-1.0 ./ (x.value.^2)) .* x.forward_derivative)
+        x.second_order_derivative .+= f.second_order_derivative ./ x.value .+ f.derivative .* ((-1.0 ./ (x.value.^2)) .* x.forward_derivative)
     end
 end
 
 local_forw_over_rev_rule[".tanh"] = (f) -> begin
     x = f.args[1]
     t = tanh.(x.value)
-    s = 1 .- t.^2  # sech^2(x)
+    s = 1 .- t.^2  
     if x.need_hess
-        x.second_order_derivative .+= f.forward_derivative .* s .+
+        x.second_order_derivative .+= f.second_order_derivative .* s .+
                                  f.derivative .* ((-2 .* t .* s) .* x.forward_derivative)
     end
 end
 
+
 local_forw_over_rev_rule[".relu"] = (f) -> begin
     x = f.args[1]
-    mask = (x.value .> 0)
+    
     if x.need_hess
-        x.second_order_derivative .+= mask .* (f.forward_derivative .+ f.derivative .* x.derivative)
+        mask = isnothing(f.memory) ? (x.value .> 0) : f.memory
+
+        if isscalar(f)
+            x.second_order_derivative += f.second_order_derivative * mask
+        else
+            x.second_order_derivative .+= f.second_order_derivative .* mask
+        end
     end
 end
 
@@ -492,11 +537,7 @@ local_forw_over_rev_rule[".^"] = (f) -> begin
         xn1 = x.value .^ (n - 1)
         xn2 = (n > 1) ? x.value .^ (n - 2) : ones_like(x)
         
-        # Terme 1 (HVP amont)
-        t1 = f.forward_derivative .* (n .* xn1) 
-        
-        # Terme 2 (Gradient amont * Hessien local * v)
-        # Utiliser x.forward_derivative (x'_v)
+        t1 = f.second_order_derivative .* (n .* xn1) 
         t2 = f.derivative .* (n*(n-1) .* xn2 .* x.forward_derivative) 
         
         x.second_order_derivative .+= t1 .+ t2
@@ -506,22 +547,21 @@ end
 local_forw_over_rev_rule["maximum"] = (f) -> begin
     x = f.args[1]
     sx, sf = shape(x), shape(f)
-    if isnothing(f.memory)
+
+
+    if x.need_hess
         if sf[1] == 1
-            f.memory = [argmax(view(x.value, :, j)) for j in 1:sx[2]]
+            for j in 1:sx[2]
+                idx = f.memory[j]
+                
+                x.second_order_derivative[idx, j] += f.second_order_derivative[1, j]
+            end
         else
-            f.memory = [argmax(view(x.value, i, :)) for i in 1:sx[1]]
-        end
-    end
-    if sf[1] == 1
-        for j in 1:sx[2]
-            idx = f.memory[j]
-            x.second_order_derivative[idx, j] += f.forward_derivative[1, j] + f.derivative[1, j] * x.derivative[idx, j]
-        end
-    else
-        for i in 1:sx[1]
-            idx = f.memory[i]
-            x.second_order_derivative[i, idx] += f.forward_derivative[i, 1] + f.derivative[i, 1] * x.derivative[i, idx]
+            for i in 1:sx[1]
+                idx = f.memory[i]
+
+                x.second_order_derivative[i, idx] += f.second_order_derivative[i, 1]
+            end
         end
     end
 end
@@ -532,8 +572,11 @@ local_forw_over_rev_rule["maximum_all"] = (f) -> begin
     if isnothing(f.memory)
         f.memory = argmax(x.value)
     end
-    idx = f.memory
-    x.second_order_derivative[idx] += f.forward_derivative + f.derivative * x.derivative[idx]
+    
+    if x.need_hess
+        idx = f.memory
+        x.second_order_derivative[idx] += f.second_order_derivative
+    end
 end
 
 
@@ -664,7 +707,6 @@ function second_order_backward(f::VectNode)
     topo_sort!(visited, topo, f)  
     reverse!(topo)                 
 
-    
     for node in topo
         if !isnothing(node.op)
             local_forw_over_rev_rule[node.op](node)
@@ -709,7 +751,6 @@ function hvp(f, x, v)
 
     backward!(last_node)    
             
-
     second_order_backward(last_node)  
 
     hv = deepcopy(v)
