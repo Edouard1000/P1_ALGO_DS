@@ -429,7 +429,7 @@ local_forw_over_rev_rule[".-"] = (f) -> begin
             x.second_order_derivative .+= f.second_order_derivative
         end
         if y.need_hess
-            y.second_order_derivative .-= f.second_order_derivative
+            y.second_order_derivative .-= compress(f.second_order_derivative, shape(y))
         end
     end
 end
@@ -472,7 +472,7 @@ local_forw_over_rev_rule["./"] = (f) -> begin
             t2_num = z2 .* x.forward_derivative .- 2.0 .* x.value .* z.value .* z.forward_derivative
             t2 = -f.derivative .* (t2_num ./ (z2 .^ 2)) 
             
-            z.second_order_derivative .+= t1 .+ t2
+            z.second_order_derivative .+= compress(t1 .+ t2, shape(z))
         end
     end
 end
